@@ -1,13 +1,11 @@
 import requests
 import uuid
-
-API_URL = "https://dev-apigateway.extramarks.com/ai-chat/chat"
+from config import API_URL, API_TOKEN
 
 HEADERS = {
     "Content-Type": "application/json",
-    "Authorization": "Bearer YOUR_TOKEN"
+    "Authorization": f"Bearer {API_TOKEN}"
 }
-
 
 def get_reply(message: str) -> str:
     data = {
@@ -17,21 +15,26 @@ def get_reply(message: str) -> str:
         "board_id": 180,
         "class_id": 1581786,
         "subject_id": 4900778,
-        "query_ppt_slide": None,
-        "query_image_path": None,
-        "query_content_path": None,
         "message_id": str(uuid.uuid4())
     }
 
     try:
-        response = requests.post(API_URL, headers=HEADERS, json=data)
+        response = requests.post(
+            API_URL,
+            headers=HEADERS,
+            json=data,
+            timeout=5
+        )
 
-        if response.status_code == 200:
-            return response.text
-        else:
-            print(f"[API ERROR] {response.status_code}: {response.text}")
-            return ""
+        response.raise_for_status()
+        res_json = response.json()
 
-    except Exception as e:
-        print(f"[API EXCEPTION] {e}")
+        return res_json.get("reply", "")
+
+    except requests.exceptions.Timeout:
+        print("[API TIMEOUT]")
+        return ""
+
+    except requests.exceptions.RequestException as e:
+        print(f"[API ERROR] {e}")
         return ""

@@ -8,6 +8,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 
 import logger
+from token_manager import ensure_token_fresh
 from ai_engine import is_relevant_question, generate_reply
 from context_manager import get_stream_context
 from config import (
@@ -25,6 +26,9 @@ MAX_SEARCH_RETRIES    = 3
 SEARCH_RETRY_DELAY    = 5
 MAX_CHATID_RETRIES    = 5   
 CHATID_RETRY_DELAY    = 6   
+LAST_FETCH_TIME       = 0
+CACHED_VIDEO_ID       = None
+RUNNING_VIDEO         = None
 
 
 def _load_seen_msgs() -> set:
@@ -50,25 +54,41 @@ def _get_youtube_client():
     return build("youtube", "v3", credentials=creds)
 
 
-def _search_live_video_ids(youtube) -> list[str]:
-    for attempt in range(1, MAX_SEARCH_RETRIES + 1):
-        try:
-            response = youtube.search().list(
-                part="id",
-                channelId=CHANNEL_ID,
-                eventType="live",
-                type="video",
-            ).execute()
-            ids = [item["id"]["videoId"] for item in response.get("items", [])]
-            if ids:
-                return ids
-            print(f"[Bot] search() empty (attempt {attempt}/{MAX_SEARCH_RETRIES}), retrying in {SEARCH_RETRY_DELAY}s...")
-            time.sleep(SEARCH_RETRY_DELAY)
-        except HttpError as e:
-            logger.log_error("search_live_video_ids", str(e))
-            time.sleep(SEARCH_RETRY_DELAY)
-    return []
+# def _search_live_video_ids(youtube) -> list[str]:
+#     for attempt in range(1, MAX_SEARCH_RETRIES + 1):
+#         try:
+#             response = youtube.search().list(
+#                 part="id",
+#                 channelId=CHANNEL_ID,
+#                 eventType="live",
+#                 type="video",
+#             ).execute()
+#             ids = [item["id"]["videoId"] for item in response.get("items", [])]
+#             if ids:
+#                 return ids
+#             print(f"[Bot] search() empty (attempt {attempt}/{MAX_SEARCH_RETRIES}), retrying in {SEARCH_RETRY_DELAY}s...")
+#             time.sleep(SEARCH_RETRY_DELAY)
+#         except HttpError as e:
+#             logger.log_error("search_live_video_ids", str(e))
+#             time.sleep(SEARCH_RETRY_DELAY)
+#     return []
 
+# def get_cached_live_video(youtube):
+#     global LAST_FETCH_TIME, CACHED_VIDEO_ID
+
+#     current_time = time.time()
+
+#     if current_time - LAST_FETCH_TIME < 300 and CACHED_VIDEO_ID:
+#         return CACHED_VIDEO_ID
+
+#     video_ids = _search_live_video_ids(youtube)
+
+#     if video_ids:
+#         CACHED_VIDEO_ID = video_ids[0]
+#         LAST_FETCH_TIME = current_time
+#         return CACHED_VIDEO_ID
+
+#     return None
 
 def get_chat_id_with_retry(youtube, video_id: str) -> str | None:
     for attempt in range(1, MAX_CHATID_RETRIES + 1):
@@ -137,8 +157,19 @@ def run():
     print("[Bot] Starting YouTube Live Chat AI Bot...")
     logger.log_info("Bot started", channel_id=CHANNEL_ID)
 
+    last_token_check = 0
+    import random
+    TOKEN_CHECK_INTERVAL = random.randint(3500, 3650)
+
     while True:
         try:
+            current_time = time.time()
+
+            if current_time - last_token_check > TOKEN_CHECK_INTERVAL:
+                print("[Token] Checking & refreshing if needed...")
+                ensure_token_fresh()
+                last_token_check = current_time
+
             youtube = _get_youtube_client()
 
             if cached_video_id:
@@ -157,23 +188,22 @@ def run():
                         cached_chat_id  = None
 
             if not cached_video_id:
-                video_ids = _search_live_video_ids(youtube)
-                if not video_ids:
+                video_id = get_cached_live_video(youtube)
+
+                if not video_id:
                     print(f"[Bot] No live streams found. Retrying in {NO_STREAM_WAIT}s...")
                     time.sleep(NO_STREAM_WAIT)
                     continue
 
-                for vid in video_ids:
-                    cid = get_chat_id_with_retry(youtube, vid)
-                    if cid:
-                        cached_video_id = vid
-                        cached_chat_id  = cid
-                        print(f"[Bot] Locked onto stream: {cached_video_id}")
-                        logger.log_info("Stream locked", video_id=cached_video_id)
-                        break
+                cid = get_chat_id_with_retry(youtube, video_id)
 
-                if not cached_video_id:
-                    print(f"[Bot] Video found but no active chat. Retrying in {CHAT_ID_LOST_WAIT}s...")
+                if cid:
+                    cached_video_id = video_id
+                    cached_chat_id = cid
+                    print(f"[Bot] Locked onto stream: {cached_video_id}")
+                    logger.log_info("Stream locked", video_id=cached_video_id)
+                else:
+                    print(f"[Bot] Video found but no active chat. Retrying...")
                     time.sleep(CHAT_ID_LOST_WAIT)
                     continue
 
@@ -186,7 +216,6 @@ def run():
 
             stream_ctx = stream_context_cache[cached_video_id]["combined"]
 
-            # ── Step 4: Poll and reply ────────────────────────────────────────
             messages, poll_interval_ms = get_messages(youtube, cached_chat_id)
 
             for msg in messages:
@@ -197,6 +226,7 @@ def run():
                 if msg_id in seen_msgs:
                     continue
                 seen_msgs.add(msg_id)
+                _save_seen_msgs(seen_msgs)
 
                 print(f"[Chat] {username}: {text}")
 
@@ -214,12 +244,19 @@ def run():
                 if not reply:
                     logger.log_skipped(cached_video_id, username, text, "empty_reply")
                     continue
+                if not username.startswith("@"):
+                    username_tag = "@" + username
+                else:
+                    username_tag = username
 
-                sent = send_reply(youtube, cached_chat_id, reply)
+                final_reply = reply if reply.startswith(username_tag) else f"{username_tag} {reply}"
+
+                sent = send_reply(youtube, cached_chat_id, final_reply)
+
                 if sent:
-                    print(f"[Bot] Replied: {reply}")
+                    print(f"[Bot] Replied: {final_reply}")
                     user_cooldowns[username] = now
-                    logger.log_replied(cached_video_id, username, text, reply)
+                    logger.log_replied(cached_video_id, username, text, final_reply)
                 else:
                     logger.log_skipped(cached_video_id, username, text, "send_failed")
 
@@ -233,3 +270,51 @@ def run():
             print(f"[Bot] Unexpected error: {e}")
             logger.log_error("main_loop", str(e))
             time.sleep(10)
+
+
+def start_bot_for_video(video_id: str, chat_id: str):
+    global RUNNING_VIDEO
+
+    if RUNNING_VIDEO == video_id:
+        print("[Bot] Already running for this video, skipping...")
+        return
+
+    RUNNING_VIDEO = video_id
+
+    print(f"[Bot] Starting for video: {video_id}")
+
+    youtube = _get_youtube_client()
+    seen_msgs = _load_seen_msgs()
+
+    try:
+        context = get_stream_context(video_id)
+    except Exception as e:
+        print("[Context Error]", e)
+        context = {"combined": ""}
+
+    while True:
+        try:
+            messages, _ = get_messages(youtube, chat_id)
+
+            for msg in messages:
+                msg_id = msg["id"]
+
+                if msg_id in seen_msgs:
+                    continue
+
+                seen_msgs.add(msg_id)
+
+                text = msg["snippet"]["displayMessage"]
+
+                if not is_relevant_question(text, context["combined"]):
+                    continue
+
+                reply = generate_reply(text, context["combined"])
+                send_reply(youtube, chat_id, reply)
+
+            _save_seen_msgs(seen_msgs)
+            time.sleep(POLL_INTERVAL_SECONDS)
+
+        except Exception as e:
+            print("[Bot Error]", e)
+            break

@@ -1,4 +1,4 @@
-***YouTube Live Chat AI Bot***
+YouTube Live Chat AI Bot
 
 An intelligent, real-time YouTube Live Chat automation system that detects relevant questions and replies with AI-generated answers.
 Built with YouTube Data API + AI pipeline + smart filtering, this bot ensures only meaningful interactions are handled while ignoring spam and casual messages.
