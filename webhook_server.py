@@ -1,54 +1,65 @@
-from flask import Flask, request
 import xml.etree.ElementTree as ET
+
+from flask import Flask, request
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
-from chat_handler import start_bot_for_video
 
-ACTIVE_VIDEO = None
+import logger
+from chat_handler import _spawn_worker
+from config import TOKEN_FILE
 
 app = Flask(__name__)
 
-TOKEN_FILE = "token.json"
 
-def get_youtube():
+def _get_youtube():
     creds = Credentials.from_authorized_user_file(TOKEN_FILE)
     return build("youtube", "v3", credentials=creds)
+
+
+def _extract_video_id(xml_data: bytes) -> str | None:
+    try:
+        root = ET.fromstring(xml_data)
+        for entry in root.findall("{http://www.w3.org/2005/Atom}entry"):
+            vid = entry.find("{http://www.youtube.com/xml/schemas/2015}videoId")
+            if vid is not None and vid.text:
+                return vid.text
+    except ET.ParseError as e:
+        logger.log_error("webhook_xml_parse", str(e))
+    return None
+
+
+def _is_live(video_id: str) -> bool:
+    try:
+        youtube = _get_youtube()
+        res = youtube.videos().list(
+            part="liveStreamingDetails",
+            id=video_id,
+        ).execute()
+        items = res.get("items", [])
+        if not items:
+            return False
+        return bool(items[0].get("liveStreamingDetails", {}).get("activeLiveChatId"))
+    except Exception as e:
+        logger.log_error(f"webhook_is_live:{video_id}", str(e))
+        return False
+
 
 @app.route("/webhook/youtube", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        return request.args.get("hub.challenge", "")
+        return request.args.get("hub.challenge", ""), 200
 
-    data = request.data
-    root = ET.fromstring(data)
-
-    video_id = None
-    for entry in root.findall("{http://www.w3.org/2005/Atom}entry"):
-        vid = entry.find("{http://www.youtube.com/xml/schemas/2015}videoId")
-        if vid is not None:
-            video_id = vid.text
-
+    video_id = _extract_video_id(request.data)
     if not video_id:
         return "", 200
 
-    youtube = get_youtube()
-
-    res = youtube.videos().list(
-        part="liveStreamingDetails",
-        id=video_id
-    ).execute()
-
-    items = res.get("items", [])
-    if not items:
-        return "", 200
-
-    chat_id = items[0]["liveStreamingDetails"].get("activeLiveChatId")
-
-    if chat_id:
-        print(f"[Webhook] LIVE detected: {video_id}")
-        start_bot_for_video(video_id, chat_id)
+    if _is_live(video_id):
+        print(f"[Webhook] Live stream detected: {video_id}")
+        logger.log_info("Webhook triggered", video_id=video_id)
+        _spawn_worker(video_id)
 
     return "", 200
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)

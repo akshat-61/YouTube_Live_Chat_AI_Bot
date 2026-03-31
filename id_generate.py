@@ -2,7 +2,7 @@ from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 
 TOKEN_FILE = "token.json"
-USERNAME   = "techscopeindia"
+USERNAME   = "akshatsrivastava4266"
 
 
 def main():
@@ -26,5 +26,17 @@ def main():
     print(f"Add this to your .env file as: CHANNEL_ID={channel_id}")
 
 
+import sys
+import config
+from chat_handler import run
+
 if __name__ == "__main__":
-    main()
+    try:
+        _ = config.CHANNEL_ID
+        _ = config.API_URL
+        _ = config.YOUTUBE_CLIENT_SECRET_FILE
+    except EnvironmentError as e:
+        print(f"[Startup Error] {e}")
+        sys.exit(1)
+
+    run()

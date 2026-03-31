@@ -1,16 +1,26 @@
-import requests
-import uuid
 import re
+import uuid
+import threading
+from collections import OrderedDict
+
+import requests
+
+import logger
 from config import API_URL
 from em_token_manager import get_fresh_token
 
-cache = {}
+_cache: OrderedDict[str, str] = OrderedDict()
+_cache_lock                   = threading.Lock()
+_CACHE_MAX                    = 300
 
-BASE_QUESTION_WORDS = [
+_context_keyword_cache: dict[str, list[str]] = {}
+_context_kw_lock                             = threading.Lock()
+
+BASE_QUESTION_WORDS = {
     "how", "what", "why", "when", "which", "where", "who", "explain",
     "tell me", "can you", "difference", "define", "meaning", "use of",
     "error", "issue", "problem", "help", "understand", "example",
-]
+}
 
 IGNORE_EXACT = {
     "lol", "nice", "bro", "hi", "hello", "hlo", "hey", "ok", "okay",
@@ -18,13 +28,40 @@ IGNORE_EXACT = {
     "first", "amazing", "cool", "thanks", "thank you", "ty",
 }
 
+_STOP_WORDS = {
+    "the", "a", "an", "and", "or", "but", "in", "on", "at", "to",
+    "for", "of", "with", "is", "are", "was", "be", "this", "that",
+    "it", "its", "by", "from", "as", "we", "will", "about", "our",
+    "stream", "title", "description", "context", "course", "series",
+}
+
+# ── FIX: raised from 6s → 15s to match real Extramarks API latency ──────────
+_API_TIMEOUT = 15
+
+
+def _cache_get(key: str) -> str | None:
+    with _cache_lock:
+        if key not in _cache:
+            return None
+        _cache.move_to_end(key)
+        return _cache[key]
+
+
+def _cache_set(key: str, value: str):
+    with _cache_lock:
+        if key in _cache:
+            _cache.move_to_end(key)
+        _cache[key] = value
+        if len(_cache) > _CACHE_MAX:
+            _cache.popitem(last=False)
+
 
 def clean_html(text: str) -> str:
     text = re.sub(r'<.*?>', ' ', text)
     text = text.replace("&nbsp;", " ")
-    text = text.replace("&lt;", "<")
-    text = text.replace("&gt;", ">")
-    text = text.replace("&amp;", "&")
+    text = text.replace("&lt;",   "<")
+    text = text.replace("&gt;",   ">")
+    text = text.replace("&amp;",  "&")
     text = text.replace("&quot;", '"')
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
@@ -33,109 +70,98 @@ def clean_html(text: str) -> str:
 def trim_for_chat(text: str, limit: int = 200) -> str:
     if len(text) <= limit:
         return text
-    cut = text[:limit]
+    cut      = text[:limit]
     last_dot = cut.rfind('.')
     if last_dot > 100:
         return cut[:last_dot + 1]
     return cut[:197] + "..."
 
 
-def _extract_context_keywords(stream_context: str) -> list[str]:
-    
-    stop_words = {
-        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to",
-        "for", "of", "with", "is", "are", "was", "be", "this", "that",
-        "it", "its", "by", "from", "as", "we", "will", "about", "our",
-        "stream", "title", "description", "context", "course", "series",
-    }
-    words = re.findall(r'\b[a-z]{4,}\b', stream_context.lower())
-    return list({w for w in words if w not in stop_words})
+def _get_context_keywords(stream_context: str) -> list[str]:
+    with _context_kw_lock:
+        if stream_context in _context_keyword_cache:
+            return _context_keyword_cache[stream_context]
+
+    words    = re.findall(r'\b[a-z]{4,}\b', stream_context.lower())
+    keywords = list({w for w in words if w not in _STOP_WORDS})
+
+    with _context_kw_lock:
+        _context_keyword_cache[stream_context] = keywords
+
+    return keywords
 
 
 def is_relevant_question(message: str, stream_context: str) -> bool:
-    message = message.lower().strip()
+    msg = message.lower().strip()
 
-    if len(message) < 5:
+    if len(msg) < 5:
         return False
 
-    if message in IGNORE_EXACT:
+    if msg in IGNORE_EXACT:
         return False
 
-    if "http" in message or "www" in message:
+    if "http" in msg or "www" in msg:
         return False
-
-    has_question_word = any(w in message for w in BASE_QUESTION_WORDS)
-
-    context_keywords = _extract_context_keywords(stream_context)
-    has_context_keyword = any(w in message for w in context_keywords)
 
     score = 0
 
-    if has_question_word:
+    if any(w in msg for w in BASE_QUESTION_WORDS):
         score += 2
 
-    if has_context_keyword:
+    if any(w in msg for w in _get_context_keywords(stream_context)):
         score += 2
 
-    if "?" in message:
+    if "?" in msg:
         score += 2
 
-    if len(message.split()) > 5:
+    if len(msg.split()) > 5:
         score += 1
 
     return score >= 2
 
 
-def fallback_reply(message: str, stream_context: str = "", username: str = "") -> str:
+def _fallback_reply(username: str) -> str:
+    tag = username if username.startswith("@") else f"@{username}"
+    return f"{tag} Nice question! Keep watching — we'll cover this soon."
+
+
+def _build_prompt(message: str, stream_context: str) -> str:
     return (
-        f"{username}, Nice question! It's related to what we're discussing "
-        f"— keep watching, you'll get clarity soon."
+        "You are a helpful AI assistant in a live YouTube stream.\n\n"
+        "Rules:\n"
+        "- Answer only questions relevant to the stream topic\n"
+        "- Be short and clear — 1 to 2 lines max\n"
+        "- Never use bullet points or markdown\n"
+        "- If unsure, give a helpful general answer related to the topic\n\n"
+        f"Stream Context:\n{stream_context}\n\n"
+        f"User Question:\n{message}\n\n"
+        "Answer:"
     )
 
 
 def generate_reply(message: str, username: str, stream_context: str) -> str:
-    cleaned = message.lower().strip()
+    cleaned = re.sub(r'[^a-z0-9 ]', '', message.lower()).strip()
 
-    if cleaned in cache:
-        return cache[cleaned]
+    cached = _cache_get(cleaned)
+    if cached:
+        return cached
 
-    if not is_relevant_question(cleaned, stream_context):
-        return ""
-
-    final_prompt = f"""
-You are a helpful AI assistant in a live YouTube stream.
-
-Your job:
-- Understand the stream topic from context
-- Answer user questions relevant to the stream
-- Be short, clear, and helpful (1-2 lines max)
-- If unsure, give a general helpful answer related to the topic
-
-Stream Context:
-{stream_context}
-
-User Question:
-{cleaned}
-
-Answer:
-"""
-
-    # ── Always get a fresh token before calling the API ──────────────────────
     try:
         token = get_fresh_token()
     except Exception as e:
         print(f"[ai_engine] Token fetch failed: {e}")
-        return fallback_reply(cleaned, stream_context, username)
+        logger.log_error("ai_engine_token", str(e))
+        return _fallback_reply(username)
 
     headers = {
         "Content-Type":  "application/json",
         "Authorization": f"Bearer {token}",
     }
 
-    data = {
+    payload = {
         "sender_uuid":  str(uuid.uuid4()),
         "chat_room_id": 240,
-        "message":      final_prompt,
+        "message":      _build_prompt(cleaned, stream_context),
         "board_id":     180,
         "class_id":     1581786,
         "subject_id":   4900778,
@@ -143,7 +169,7 @@ Answer:
     }
 
     try:
-        response = requests.post(API_URL, headers=headers, json=data, timeout=10)
+        response = requests.post(API_URL, headers=headers, json=payload, timeout=_API_TIMEOUT)
 
         reply = ""
 
@@ -158,15 +184,18 @@ Answer:
             reply = clean_html(raw).strip()
 
         if not reply:
-            reply = fallback_reply(cleaned, stream_context, username)
+            return _fallback_reply(username)
 
-        reply = trim_for_chat(reply, limit=200)
-
-        if len(cache) > 100:
-            cache.clear()
-
-        cache[cleaned] = reply
+        reply = trim_for_chat(reply, limit=800)
+        _cache_set(cleaned, reply)
         return reply
 
-    except Exception:
-        return fallback_reply(cleaned, stream_context, username)
+    except requests.exceptions.Timeout:
+        print(f"[ai_engine] Request timed out for: {cleaned[:50]}")
+        logger.log_error("ai_engine_timeout", cleaned[:50])
+        return _fallback_reply(username)
+
+    except Exception as e:
+        print(f"[ai_engine] Unexpected error: {e}")
+        logger.log_error("ai_engine_error", str(e))
+        return _fallback_reply(username)

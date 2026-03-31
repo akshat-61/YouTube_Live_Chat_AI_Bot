@@ -1,12 +1,18 @@
 import json
+import threading
 from datetime import datetime, timezone
+
 from config import LOG_FILE
+
+_log_lock = threading.Lock()
 
 
 def _write(record: dict):
     record["timestamp"] = datetime.now(timezone.utc).isoformat()
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    with _log_lock:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
 
 
 def log_replied(video_id: str, username: str, message: str, reply: str):

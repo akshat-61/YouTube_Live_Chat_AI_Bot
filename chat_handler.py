@@ -1,320 +1,225 @@
 import json
 import os
 import time
-
+import threading
+import queue
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 
 import logger
 from token_manager import ensure_token_fresh
-from ai_engine import is_relevant_question, generate_reply
+from ai_engine import generate_reply
 from context_manager import get_stream_context
 from config import (
     POLL_INTERVAL_SECONDS,
     USER_COOLDOWN_SECONDS,
     SEEN_MSGS_FILE,
     CHANNEL_ID,
+    TOKEN_FILE,
+    MAX_STREAMS,
+    STREAM_DISCOVERY_INTERVAL,
+    SEEN_MSGS_FLUSH_INTERVAL,
 )
 
-TOKEN_FILE = "token.json"
+_seen_msgs = {}
+_seen_msgs_lock = threading.Lock()
 
-NO_STREAM_WAIT        = 30
-CHAT_ID_LOST_WAIT     = 10
-MAX_SEARCH_RETRIES    = 3
-SEARCH_RETRY_DELAY    = 5
-MAX_CHATID_RETRIES    = 5   
-CHATID_RETRY_DELAY    = 6   
-LAST_FETCH_TIME       = 0
-CACHED_VIDEO_ID       = None
-RUNNING_VIDEO         = None
+_user_cooldowns = {}
+_cooldowns_lock = threading.Lock()
 
+_active_threads = {}
+_threads_lock = threading.Lock()
 
-def _load_seen_msgs() -> set:
-    if os.path.exists(SEEN_MSGS_FILE):
-        with open(SEEN_MSGS_FILE, "r") as f:
-            return set(json.load(f))
-    return set()
+_stream_context_cache = {}
+_context_lock = threading.Lock()
 
+# ── NEW: lock to protect token.json from concurrent refresh ──────────────────
+_token_lock = threading.Lock()
 
-def _save_seen_msgs(seen: set):
-    with open(SEEN_MSGS_FILE, "w") as f:
-        json.dump(list(seen), f)
+message_queue = queue.Queue()
 
 
 def _get_youtube_client():
-    if not os.path.exists(TOKEN_FILE):
-        raise FileNotFoundError("OAuth token not found. Run python oauth_setup.py first.")
-    creds = Credentials.from_authorized_user_file(TOKEN_FILE)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        with open(TOKEN_FILE, "w") as f:
-            f.write(creds.to_json())
+    """
+    Always create a fresh YouTube client.
+    Token refresh is serialised with _token_lock so multiple threads
+    cannot corrupt token.json simultaneously.
+    """
+    with _token_lock:
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE)
+        if creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            with open(TOKEN_FILE, "w") as f:
+                f.write(creds.to_json())
+    # Build outside the lock — network I/O, no shared state
     return build("youtube", "v3", credentials=creds)
 
 
-# def _search_live_video_ids(youtube) -> list[str]:
-#     for attempt in range(1, MAX_SEARCH_RETRIES + 1):
-#         try:
-#             response = youtube.search().list(
-#                 part="id",
-#                 channelId=CHANNEL_ID,
-#                 eventType="live",
-#                 type="video",
-#             ).execute()
-#             ids = [item["id"]["videoId"] for item in response.get("items", [])]
-#             if ids:
-#                 return ids
-#             print(f"[Bot] search() empty (attempt {attempt}/{MAX_SEARCH_RETRIES}), retrying in {SEARCH_RETRY_DELAY}s...")
-#             time.sleep(SEARCH_RETRY_DELAY)
-#         except HttpError as e:
-#             logger.log_error("search_live_video_ids", str(e))
-#             time.sleep(SEARCH_RETRY_DELAY)
-#     return []
-
-# def get_cached_live_video(youtube):
-#     global LAST_FETCH_TIME, CACHED_VIDEO_ID
-
-#     current_time = time.time()
-
-#     if current_time - LAST_FETCH_TIME < 300 and CACHED_VIDEO_ID:
-#         return CACHED_VIDEO_ID
-
-#     video_ids = _search_live_video_ids(youtube)
-
-#     if video_ids:
-#         CACHED_VIDEO_ID = video_ids[0]
-#         LAST_FETCH_TIME = current_time
-#         return CACHED_VIDEO_ID
-
-#     return None
-
-def get_chat_id_with_retry(youtube, video_id: str) -> str | None:
-    for attempt in range(1, MAX_CHATID_RETRIES + 1):
-        try:
-            response = youtube.videos().list(
-                part="liveStreamingDetails",
-                id=video_id,
-            ).execute()
-            items = response.get("items", [])
-            if items:
-                chat_id = items[0]["liveStreamingDetails"].get("activeLiveChatId")
-                if chat_id:
-                    return chat_id
-            print(f"[Bot] No activeLiveChatId (attempt {attempt}/{MAX_CHATID_RETRIES}), retrying in {CHATID_RETRY_DELAY}s...")
-            time.sleep(CHATID_RETRY_DELAY)
-        except (HttpError, IndexError, KeyError) as e:
-            logger.log_error(f"get_chat_id:{video_id}", str(e))
-            time.sleep(CHATID_RETRY_DELAY)
-    return None
-
-
-def get_messages(youtube, chat_id: str) -> tuple[list, int]:
-    try:
-        response = youtube.liveChatMessages().list(
-            liveChatId=chat_id,
-            part="snippet,authorDetails",
-        ).execute()
-        interval_ms = response.get("pollingIntervalMillis", POLL_INTERVAL_SECONDS * 1000)
-        return response.get("items", []), interval_ms
-    except HttpError as e:
-        logger.log_error(f"get_messages:{chat_id}", str(e))
-        return [], POLL_INTERVAL_SECONDS * 1000
-
-
-def send_reply(youtube, chat_id: str, text: str) -> bool:
-    try:
-        youtube.liveChatMessages().insert(
-            part="snippet",
-            body={
-                "snippet": {
-                    "liveChatId": chat_id,
-                    "type": "textMessageEvent",
-                    "textMessageDetails": {"messageText": text},
-                }
-            },
-        ).execute()
+def _mark_seen(video_id, msg_id):
+    with _seen_msgs_lock:
+        if video_id not in _seen_msgs:
+            _seen_msgs[video_id] = set()
+        if msg_id in _seen_msgs[video_id]:
+            return False
+        _seen_msgs[video_id].add(msg_id)
         return True
-    except HttpError as e:
-        logger.log_error(f"send_reply:{chat_id}", str(e))
-        return False
+
+
+def _get_stream_context(video_id):
+    with _context_lock:
+        if video_id in _stream_context_cache:
+            return _stream_context_cache[video_id]
+    ctx = get_stream_context(video_id)
+    with _context_lock:
+        _stream_context_cache[video_id] = ctx
+    return ctx
+
+
+def _fetch_messages_worker(video_id):
+    yt = _get_youtube_client()
+    res = yt.videos().list(part="liveStreamingDetails", id=video_id).execute()
+    items = res.get("items", [])
+    if not items:
+        return
+
+    chat_id = items[0]["liveStreamingDetails"].get("activeLiveChatId")
+    if not chat_id:
+        return
+
+    ctx = _get_stream_context(video_id)["combined"]
+
+    while True:
+        try:
+            res = yt.liveChatMessages().list(
+                liveChatId=chat_id,
+                part="snippet,authorDetails",
+            ).execute()
+
+            for msg in res.get("items", []):
+                msg_id = msg["id"]
+                if not _mark_seen(video_id, msg_id):
+                    continue
+
+                message_queue.put((video_id, chat_id, msg, ctx))
+
+            time.sleep(2)
+
+        except Exception:
+            time.sleep(5)
+
+
+def _process_messages_worker():
+    """
+    Each iteration builds a FRESH yt client only when it needs to send a reply.
+    This avoids any shared credentials state between threads.
+    """
+    while True:
+        try:
+            video_id, chat_id, msg, ctx = message_queue.get()
+            print(f"[QUEUE] {video_id} | {msg['authorDetails']['displayName']} → {msg['snippet']['displayMessage']}", flush=True)
+            print(f"[QUEUE SIZE] {message_queue.qsize()}", flush=True)
+
+            username = msg["authorDetails"]["displayName"]
+            text = msg["snippet"]["displayMessage"]
+
+            now = time.time()
+
+            with _cooldowns_lock:
+                if video_id not in _user_cooldowns:
+                    _user_cooldowns[video_id] = {}
+                last = _user_cooldowns[video_id].get(username, 0)
+
+            if now - last < USER_COOLDOWN_SECONDS:
+                print(f"[SKIP] {video_id} | {username} → {text}", flush=True)
+                continue
+
+            if len(text.split()) < 2:
+                print(f"[SKIP][TOO_SHORT] {video_id} | {username} → {text}", flush=True)
+                continue
+
+            if text.startswith("@"):
+                print(f"[SKIP][BOT_REPLY] {video_id} | {username} → {text}", flush=True)
+                continue
+
+            start = time.time()
+            reply = generate_reply(text, username, ctx)
+            latency = time.time() - start
+
+            if latency > 8:
+                print(f"[SLOW] {latency:.2f}s | {video_id} | {username}", flush=True)
+
+            if not reply:
+                reply = f"{username} please wait, answering shortly!"
+
+            tag = username if username.startswith("@") else f"@{username}"
+            final = reply if reply.startswith(tag) else f"{tag} {reply}"
+
+            # ── FIX: trim AFTER prepending tag — tag itself adds ~15 chars ───
+            # ai_engine trims to 200 but tag prepend can push it to 215+
+            # YouTube hard limit is 200 chars → causes INVALID_REQUEST_METADATA
+            if len(final) > 200:
+                cut = final[:200]
+                last_dot = cut.rfind(".")
+                final = cut[:last_dot + 1] if last_dot > 50 else cut[:197] + "..."
+
+            # ── FIX: fresh client per reply — no shared credentials state ────
+            try:
+                yt = _get_youtube_client()
+                yt.liveChatMessages().insert(
+                    part="snippet",
+                    body={
+                        "snippet": {
+                            "liveChatId": chat_id,
+                            "type": "textMessageEvent",
+                            "textMessageDetails": {"messageText": final},
+                        }
+                    },
+                ).execute()
+                print(f"[REPLY] {video_id} | {username} → {final}", flush=True)
+
+                with _cooldowns_lock:
+                    _user_cooldowns[video_id][username] = now
+
+            except Exception as e:
+                print(f"[ERROR] {e}", flush=True)
+                logger.log_error("reply_send", str(e))
+
+        except Exception:
+            time.sleep(2)
+
+
+def _spawn_stream(video_id):
+    with _threads_lock:
+        if video_id in _active_threads:
+            return
+
+        t = threading.Thread(target=_fetch_messages_worker, args=(video_id,), daemon=True)
+        _active_threads[video_id] = t
+        t.start()
 
 
 def run():
-    seen_msgs: set                        = _load_seen_msgs()
-    user_cooldowns: dict[str, float]      = {}
-    stream_context_cache: dict[str, dict] = {}
-
-    cached_video_id: str | None = None
-    cached_chat_id:  str | None = None
-
-    env_video_id = os.getenv("LIVE_VIDEO_ID", "").strip()
-    if env_video_id:
-        cached_video_id = env_video_id
-        print(f"[Bot] Using LIVE_VIDEO_ID from .env: {cached_video_id}")
-
-    print("[Bot] Starting YouTube Live Chat AI Bot...")
-    logger.log_info("Bot started", channel_id=CHANNEL_ID)
-
-    last_token_check = 0
-    import random
-    TOKEN_CHECK_INTERVAL = random.randint(3500, 3650)
+    for _ in range(3):
+        threading.Thread(target=_process_messages_worker, daemon=True).start()
 
     while True:
         try:
-            current_time = time.time()
+            yt = _get_youtube_client()
+            res = yt.search().list(
+                part="id",
+                channelId=CHANNEL_ID,
+                eventType="live",
+                type="video",
+                maxResults=MAX_STREAMS,
+            ).execute()
 
-            if current_time - last_token_check > TOKEN_CHECK_INTERVAL:
-                print("[Token] Checking & refreshing if needed...")
-                ensure_token_fresh()
-                last_token_check = current_time
+            vids = [i["id"]["videoId"] for i in res.get("items", [])]
 
-            youtube = _get_youtube_client()
+            for v in vids:
+                _spawn_stream(v)
 
-            if cached_video_id:
-                chat_id = get_chat_id_with_retry(youtube, cached_video_id)
-                if chat_id:
-                    cached_chat_id = chat_id
-                else:
-                    print(f"[Bot] Stream {cached_video_id} ended or chat permanently closed.")
-                    logger.log_info("Stream ended", video_id=cached_video_id)
-                    if env_video_id:
-                        print(f"[Bot] Will keep retrying in {NO_STREAM_WAIT}s...")
-                        time.sleep(NO_STREAM_WAIT)
-                        continue
-                    else:
-                        cached_video_id = None
-                        cached_chat_id  = None
+            time.sleep(STREAM_DISCOVERY_INTERVAL)
 
-            if not cached_video_id:
-                video_id = get_cached_live_video(youtube)
-
-                if not video_id:
-                    print(f"[Bot] No live streams found. Retrying in {NO_STREAM_WAIT}s...")
-                    time.sleep(NO_STREAM_WAIT)
-                    continue
-
-                cid = get_chat_id_with_retry(youtube, video_id)
-
-                if cid:
-                    cached_video_id = video_id
-                    cached_chat_id = cid
-                    print(f"[Bot] Locked onto stream: {cached_video_id}")
-                    logger.log_info("Stream locked", video_id=cached_video_id)
-                else:
-                    print(f"[Bot] Video found but no active chat. Retrying...")
-                    time.sleep(CHAT_ID_LOST_WAIT)
-                    continue
-
-            # ── Step 3: Load stream context once ─────────────────────────────
-            if cached_video_id not in stream_context_cache:
-                ctx = get_stream_context(cached_video_id)
-                stream_context_cache[cached_video_id] = ctx
-                print(f"[Bot] Stream: {ctx['title']}")
-                logger.log_info("Stream context loaded", video_id=cached_video_id, title=ctx["title"])
-
-            stream_ctx = stream_context_cache[cached_video_id]["combined"]
-
-            messages, poll_interval_ms = get_messages(youtube, cached_chat_id)
-
-            for msg in messages:
-                msg_id   = msg["id"]
-                username = msg["authorDetails"]["displayName"]
-                text     = msg["snippet"]["displayMessage"]
-
-                if msg_id in seen_msgs:
-                    continue
-                seen_msgs.add(msg_id)
-                _save_seen_msgs(seen_msgs)
-
-                print(f"[Chat] {username}: {text}")
-
-                now = time.time()
-                if now - user_cooldowns.get(username, 0) < USER_COOLDOWN_SECONDS:
-                    logger.log_skipped(cached_video_id, username, text, "user_cooldown")
-                    continue
-
-                if not is_relevant_question(text, stream_ctx):
-                    print(f"[Bot] Not relevant — skipping.")
-                    logger.log_skipped(cached_video_id, username, text, "not_relevant")
-                    continue
-
-                reply = generate_reply(text, username, stream_ctx)
-                if not reply:
-                    logger.log_skipped(cached_video_id, username, text, "empty_reply")
-                    continue
-                if not username.startswith("@"):
-                    username_tag = "@" + username
-                else:
-                    username_tag = username
-
-                final_reply = reply if reply.startswith(username_tag) else f"{username_tag} {reply}"
-
-                sent = send_reply(youtube, cached_chat_id, final_reply)
-
-                if sent:
-                    print(f"[Bot] Replied: {final_reply}")
-                    user_cooldowns[username] = now
-                    logger.log_replied(cached_video_id, username, text, final_reply)
-                else:
-                    logger.log_skipped(cached_video_id, username, text, "send_failed")
-
-            _save_seen_msgs(seen_msgs)
-
-            wait_s = poll_interval_ms / 1000
-            print(f"[Bot] Waiting {wait_s:.1f}s...")
-            time.sleep(wait_s)
-
-        except Exception as e:
-            print(f"[Bot] Unexpected error: {e}")
-            logger.log_error("main_loop", str(e))
+        except Exception:
             time.sleep(10)
-
-
-def start_bot_for_video(video_id: str, chat_id: str):
-    global RUNNING_VIDEO
-
-    if RUNNING_VIDEO == video_id:
-        print("[Bot] Already running for this video, skipping...")
-        return
-
-    RUNNING_VIDEO = video_id
-
-    print(f"[Bot] Starting for video: {video_id}")
-
-    youtube = _get_youtube_client()
-    seen_msgs = _load_seen_msgs()
-
-    try:
-        context = get_stream_context(video_id)
-    except Exception as e:
-        print("[Context Error]", e)
-        context = {"combined": ""}
-
-    while True:
-        try:
-            messages, _ = get_messages(youtube, chat_id)
-
-            for msg in messages:
-                msg_id = msg["id"]
-
-                if msg_id in seen_msgs:
-                    continue
-
-                seen_msgs.add(msg_id)
-
-                text = msg["snippet"]["displayMessage"]
-
-                if not is_relevant_question(text, context["combined"]):
-                    continue
-
-                reply = generate_reply(text, context["combined"])
-                send_reply(youtube, chat_id, reply)
-
-            _save_seen_msgs(seen_msgs)
-            time.sleep(POLL_INTERVAL_SECONDS)
-
-        except Exception as e:
-            print("[Bot Error]", e)
-            break
