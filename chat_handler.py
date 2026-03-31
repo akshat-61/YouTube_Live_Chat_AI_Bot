@@ -34,25 +34,22 @@ _threads_lock = threading.Lock()
 _stream_context_cache = {}
 _context_lock = threading.Lock()
 
-# ── NEW: lock to protect token.json from concurrent refresh ──────────────────
 _token_lock = threading.Lock()
 
 message_queue = queue.Queue()
 
+_YT_CHAR_LIMIT = 200
+
+_MULTI_PART_DELAY = 1.5
+
 
 def _get_youtube_client():
-    """
-    Always create a fresh YouTube client.
-    Token refresh is serialised with _token_lock so multiple threads
-    cannot corrupt token.json simultaneously.
-    """
     with _token_lock:
         creds = Credentials.from_authorized_user_file(TOKEN_FILE)
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
             with open(TOKEN_FILE, "w") as f:
                 f.write(creds.to_json())
-    # Build outside the lock — network I/O, no shared state
     return build("youtube", "v3", credentials=creds)
 
 
@@ -74,6 +71,80 @@ def _get_stream_context(video_id):
     with _context_lock:
         _stream_context_cache[video_id] = ctx
     return ctx
+
+
+def _split_reply(tag: str, reply: str) -> list[str]:
+    import re
+
+    clean_reply = reply
+    if reply.startswith(tag):
+        clean_reply = reply[len(tag):].lstrip()
+
+    if len(f"{tag} {clean_reply}") <= _YT_CHAR_LIMIT:
+        return [f"{tag} {clean_reply}"]
+
+    sentences = re.split(r'(?<=[.?!])\s+', clean_reply.strip())
+    sentences = [s.strip() for s in sentences if s.strip()]
+
+    LABEL_RESERVE = 8
+    available = _YT_CHAR_LIMIT - len(tag) - 1 - LABEL_RESERVE
+
+    raw_parts = []
+    current = ""
+
+    for sentence in sentences:
+        if len(sentence) > available:
+            if current:
+                raw_parts.append(current)
+                current = ""
+            words = sentence.split()
+            chunk = ""
+            for word in words:
+                candidate = f"{chunk} {word}".strip()
+                if len(candidate) <= available:
+                    chunk = candidate
+                else:
+                    if chunk:
+                        raw_parts.append(chunk)
+                    chunk = word
+            if chunk:
+                raw_parts.append(chunk)
+        else:
+            candidate = f"{current} {sentence}".strip() if current else sentence
+            if len(candidate) <= available:
+                current = candidate
+            else:
+                if current:
+                    raw_parts.append(current)
+                current = sentence
+
+    if current:
+        raw_parts.append(current)
+
+    total = len(raw_parts)
+    result = []
+    for i, part in enumerate(raw_parts, 1):
+        label = f" ({i}/{total})" if total > 1 else ""
+        msg = f"{tag} {part}{label}"
+        if len(msg) > _YT_CHAR_LIMIT:
+            overhead = len(tag) + 1 + len(label)
+            msg = f"{tag} {part[:_YT_CHAR_LIMIT - overhead - 3]}...{label}"
+        result.append(msg)
+
+    return result
+
+
+def _send_message(yt, chat_id: str, text: str):
+    yt.liveChatMessages().insert(
+        part="snippet",
+        body={
+            "snippet": {
+                "liveChatId": chat_id,
+                "type": "textMessageEvent",
+                "textMessageDetails": {"messageText": text},
+            }
+        },
+    ).execute()
 
 
 def _fetch_messages_worker(video_id):
@@ -110,10 +181,6 @@ def _fetch_messages_worker(video_id):
 
 
 def _process_messages_worker():
-    """
-    Each iteration builds a FRESH yt client only when it needs to send a reply.
-    This avoids any shared credentials state between threads.
-    """
     while True:
         try:
             video_id, chat_id, msg, ctx = message_queue.get()
@@ -150,33 +217,23 @@ def _process_messages_worker():
                 print(f"[SLOW] {latency:.2f}s | {video_id} | {username}", flush=True)
 
             if not reply:
-                reply = f"{username} please wait, answering shortly!"
+                reply = f"please wait, answering shortly!"
 
             tag = username if username.startswith("@") else f"@{username}"
-            final = reply if reply.startswith(tag) else f"{tag} {reply}"
 
-            # ── FIX: trim AFTER prepending tag — tag itself adds ~15 chars ───
-            # ai_engine trims to 200 but tag prepend can push it to 215+
-            # YouTube hard limit is 200 chars → causes INVALID_REQUEST_METADATA
-            if len(final) > 200:
-                cut = final[:200]
-                last_dot = cut.rfind(".")
-                final = cut[:last_dot + 1] if last_dot > 50 else cut[:197] + "..."
+            # Split into multiple parts if needed — nothing gets cut
+            parts = _split_reply(tag, reply)
 
-            # ── FIX: fresh client per reply — no shared credentials state ────
             try:
                 yt = _get_youtube_client()
-                yt.liveChatMessages().insert(
-                    part="snippet",
-                    body={
-                        "snippet": {
-                            "liveChatId": chat_id,
-                            "type": "textMessageEvent",
-                            "textMessageDetails": {"messageText": final},
-                        }
-                    },
-                ).execute()
-                print(f"[REPLY] {video_id} | {username} → {final}", flush=True)
+
+                for i, part in enumerate(parts):
+                    _send_message(yt, chat_id, part)
+                    print(f"[REPLY {i+1}/{len(parts)}] {video_id} | {username} → {part}", flush=True)
+
+                    # Delay between parts to avoid rate limiting
+                    if i < len(parts) - 1:
+                        time.sleep(_MULTI_PART_DELAY)
 
                 with _cooldowns_lock:
                     _user_cooldowns[video_id][username] = now
