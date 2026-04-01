@@ -1,6 +1,8 @@
 import sys
 import config
 from chat_handler import run
+from topic_parser import parse_text_to_json
+parse_text_to_json("topics.txt")
 
 if __name__ == "__main__":
     try:

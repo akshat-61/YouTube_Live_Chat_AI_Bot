@@ -6,6 +6,9 @@ import queue
 from googleapiclient.discovery import build
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
+from topic_announcer import start_announcer
+import datetime
+
 
 import logger
 from token_manager import ensure_token_fresh
@@ -157,6 +160,20 @@ def _fetch_messages_worker(video_id):
     chat_id = items[0]["liveStreamingDetails"].get("activeLiveChatId")
     if not chat_id:
         return
+
+    details = items[0]["liveStreamingDetails"]
+    start_time_str = details.get("actualStartTime")
+
+    if start_time_str:
+        dt = datetime.datetime.fromisoformat(start_time_str.replace("Z", "+00:00"))
+        stream_start_epoch = dt.timestamp()
+
+        start_announcer(
+            stream_start_epoch,
+            _send_message,
+            yt,
+            chat_id
+        )
 
     ctx = _get_stream_context(video_id)["combined"]
 
