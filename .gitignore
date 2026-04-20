@@ -5,3 +5,7 @@ chat_log.json
 seen_msgs.json
 __pycache__/
 .env
+topics.json
+.gitignore
+workspace.code-workspace
+topics.txt
