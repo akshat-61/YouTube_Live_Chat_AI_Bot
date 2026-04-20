@@ -42,7 +42,7 @@ def _is_live(video_id: str) -> bool:
     except Exception as e:
         logger.log_error(f"webhook_is_live:{video_id}", str(e))
         return False
-
+7
 
 @app.route("/webhook/youtube", methods=["GET", "POST"])
 def webhook():

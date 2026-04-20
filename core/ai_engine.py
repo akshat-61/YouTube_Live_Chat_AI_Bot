@@ -35,7 +35,6 @@ _STOP_WORDS = {
     "stream", "title", "description", "context", "course", "series",
 }
 
-# ── FIX: raised from 6s → 15s to match real Extramarks API latency ──────────
 _API_TIMEOUT = 15
 
 
