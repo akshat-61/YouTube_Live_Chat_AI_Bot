@@ -1,3 +1,4 @@
+import re
 import json
 import os
 import time
@@ -77,7 +78,6 @@ def _get_stream_context(video_id):
 
 
 def _split_reply(tag: str, reply: str) -> list[str]:
-    import re
 
     clean_reply = reply
     if reply.startswith(tag):

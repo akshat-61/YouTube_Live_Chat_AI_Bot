@@ -34,6 +34,6 @@ def parse_text_to_json(input_file, output_file="topics.json"):
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(topics, f, indent=2, ensure_ascii=False)
 
-    print("✅ topics.json generated successfully")
+    print("topics.json generated successfully")
 
     return topics

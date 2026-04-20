@@ -25,7 +25,7 @@ def main():
     with open(TOKEN_FILE, "w") as f:
         f.write(credentials.to_json())
 
-    print(f"[OAuth] ✅ Token saved to {TOKEN_FILE}")
+    print(f"[OAuth] Token saved to {TOKEN_FILE}")
     print("[OAuth] You can now run main.py — the bot will use this token to send replies.")
 
 

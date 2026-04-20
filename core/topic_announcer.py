@@ -13,7 +13,7 @@ def _parse_time(ts):
 
 def start_announcer(stream_start_epoch, send_message, yt, chat_id):
     def worker():
-        print("🚀 Topic Announcer Started")
+        print("Topic Announcer Started")
 
         try:
             with open("topics.json", "r", encoding="utf-8") as f:
