@@ -20,6 +20,7 @@ BASE_QUESTION_WORDS = {
     "how", "what", "why", "when", "which", "where", "who", "explain",
     "tell me", "can you", "difference", "define", "meaning", "use of",
     "error", "issue", "problem", "help", "understand", "example",
+    "#DOUBT", "#Doubt", "Question", "?",
 }
 
 IGNORE_EXACT = {
